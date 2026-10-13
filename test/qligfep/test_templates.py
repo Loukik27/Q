@@ -928,3 +928,25 @@ class TestQprepProteinTemplate:
         assert "addbond 50:SG 80:SG y" in content
         # cysbonds should appear before maketop
         assert content.index("addbond 10:SG 25:SG y") < content.index("maketop")
+
+    def test_render_with_cofactor_libraries(self):
+        """Cofactor libraries are read after the force field's, before the single rprm."""
+        from QligFEP.templates.qprep import (
+            QprepProteinParameters,
+            render_qprep_protein_input,
+        )
+
+        params = QprepProteinParameters(
+            ff_lib_path="qamber14.lib",
+            ff_prm_path="qamber14_merged.prm",
+            pdb_file_path="protein.pdb",
+            cog="0.0 0.0 0.0",
+            sphere_radius="25",
+            solvent_pack="2.3",
+            extra_lib_paths=["LIG.lib", "NAD.lib"],
+        )
+
+        lines = render_qprep_protein_input(params).splitlines()
+
+        assert lines[:4] == ["rl qamber14.lib", "rl LIG.lib", "rl NAD.lib", "rprm qamber14_merged.prm"]
+        assert sum(line.startswith("rprm") for line in lines) == 1

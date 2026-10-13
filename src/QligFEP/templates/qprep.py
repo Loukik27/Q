@@ -4,7 +4,7 @@ Provides templates for qprep input files used in FEP setup (dual topology)
 and protein preparation workflows.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -56,6 +56,7 @@ class QprepProteinParameters:
     sphere_radius: str  # Sphere radius
     solvent_pack: str  # Solvent packing value
     cysbonds: str = ""  # Cysbond lines (empty string if none)
+    extra_lib_paths: list[str] = field(default_factory=list)  # Cofactor/ligand libraries, read after the FF
 
 
 def render_qprep_fep_input(params: QprepFEPParameters) -> str:
@@ -155,8 +156,9 @@ def render_qprep_protein_input(params: QprepProteinParameters) -> str:
     Returns:
         Complete qprep.inp file content as string
     """
-    lines = [
-        f"rl {params.ff_lib_path}",
+    lines = [f"rl {params.ff_lib_path}"]
+    lines += [f"rl {library}" for library in params.extra_lib_paths]
+    lines += [
         f"rprm {params.ff_prm_path}",
         "! TO DO Change if protein system is used",
         f"rp {params.pdb_file_path}",

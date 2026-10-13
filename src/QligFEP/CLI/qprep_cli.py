@@ -14,6 +14,7 @@ from ..IO import (
     parse_lib,
     parse_prm_options,
     parse_qprep_total_charge,
+    read_prm,
     run_qprep,
 )
 from ..logger import logger, setup_logger
@@ -928,6 +929,52 @@ class Neutralizer:
                     logger.debug(f"    Atoms removed: {', '.join(mod_info['atoms_removed'])}")
 
 
+_PARAMETER_SECTIONS = ("[options]", "[atom_types]", "[bonds]", "[angles]", "[torsions]", "[impropers]")
+
+
+def resolve_cofactor(entry: str, cwd: Path) -> tuple[Path, Path | None, Path | None]:
+    """Return the ``.pdb``, ``.lib`` and ``.prm`` files of a cofactor.
+
+    The entry can be a basename or a ``.pdb`` path. The library and parameter files
+    are optional, for residues already in the force field, but must come as a pair.
+    """
+    base = cwd / entry
+    if base.suffix == ".pdb":
+        base = base.with_suffix("")
+    pdb_path = base.with_name(f"{base.name}.pdb")
+    if not pdb_path.exists():
+        raise FileNotFoundError(f"Cofactor PDB not found: {pdb_path}")
+
+    lib_path = base.with_name(f"{base.name}.lib")
+    prm_path = base.with_name(f"{base.name}.prm")
+    if lib_path.exists() and prm_path.exists():
+        return pdb_path, lib_path, prm_path
+    if lib_path.exists() or prm_path.exists():
+        missing = prm_path if lib_path.exists() else lib_path
+        raise FileNotFoundError(f"Cofactor {base.name} needs both a .lib and a .prm file; missing {missing}")
+    logger.warning(
+        f"No {base.name}.lib/.prm found next to {pdb_path.name}; its residues must be in the force field library"
+    )
+    return pdb_path, None, None
+
+
+def write_merged_prm(ff_prm_path: str | Path, extra_prms: Sequence[Path], output_path: Path) -> Path:
+    """Merge cofactor parameters into the force field's, as qprep reads a single prm.
+
+    Options are taken from the force field only.
+    """
+    parameters = read_prm([str(ff_prm_path)])
+    extra = read_prm([str(path) for path in extra_prms])
+    with output_path.open("w") as out:
+        for section in _PARAMETER_SECTIONS:
+            out.write(f"{section}\n")
+            out.writelines(parameters[section])
+            if section != "[options]" and extra[section]:
+                out.write(f"! Cofactor {section.strip('[]')}\n")
+                out.writelines(extra[section])
+    return output_path
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1024,8 +1071,10 @@ def parse_arguments() -> argparse.Namespace:
         dest="cofactors",
         nargs="*",
         help=(
-            "List of cofactors to be added to the system. Inputs should be one or more "
-            "pdb files containing the cofactors to be added."
+            "List of cofactors (or ligands) to be added to the system, as basenames or .pdb files. "
+            "If NAME.lib and NAME.prm exist next to NAME.pdb, the library is read by qprep and "
+            "the parameters are merged with the force field's. Without them, the cofactor "
+            "residues must already be in the force field library."
         ),
     )
     parser.add_argument(
@@ -1136,10 +1185,16 @@ def main(
             )
 
     # Step 2: Add cofactors if provided
+    extra_libs: list[Path] = []
+    extra_prms: list[Path] = []
     if args.cofactors:
         logger.info(f"Adding {len(args.cofactors)} cofactor(s)")
         for cofactor in args.cofactors:
-            pdb_data = append_pdb_to_another(pdb_data, cwd / cofactor, ignore_waters=True)
+            cofactor_pdb, cofactor_lib, cofactor_prm = resolve_cofactor(cofactor, cwd)
+            pdb_data = append_pdb_to_another(pdb_data, cofactor_pdb, ignore_waters=True)
+            if cofactor_lib is not None:
+                extra_libs.append(cofactor_lib)
+                extra_prms.append(cofactor_prm)
         processing_steps.append("added cofactors")
 
     # Step 3: Neutralization
@@ -1226,14 +1281,21 @@ def main(
 
     cysbonds = handle_cysbonds(args.cysbond, pdb_file, comment_out=True)
 
+    prm_path = ff_prm_path
+    if extra_prms:
+        merged_prm = write_merged_prm(ff_prm_path, extra_prms, cwd / f"{Path(ff_prm_path).stem}_merged.prm")
+        prm_path = str(merged_prm)
+        logger.info(f"Cofactor parameters merged into {merged_prm.name}")
+
     params = QprepProteinParameters(
         ff_lib_path=ff_lib_path,
-        ff_prm_path=ff_prm_path,
+        ff_prm_path=prm_path,
         pdb_file_path=pdb_file,
         cog=cog,
         sphere_radius=sphereradius,
         solvent_pack=formatted_solvent_pack,
         cysbonds=cysbonds,
+        extra_lib_paths=[str(path) for path in extra_libs],
     )
 
     if qprep_inp_path.exists():

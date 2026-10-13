@@ -261,6 +261,45 @@ class TestProteinComplexCoordinates:
         assert all(atom[4] != "HOH" for residue in run.pdb.values() for atom in residue)
         assert set(run.pdb) == {1}
 
+    LEU = (
+        "ATOM      1  N   LEU A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+        "ATOM      2  CA  LEU A   1       1.450   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  C   LEU A   1       2.000   1.400   0.000  1.00  0.00           C\n"
+        "ATOM      4  O   LEU A   1       1.400   2.400   0.000  1.00  0.00           O\n"
+        "ATOM      5  CB  LEU A   1       1.900  -0.800   1.200  1.00  0.00           C\n"
+    )
+    LIG = (
+        "HETATM    1  C1  LIG B   1       8.000   8.000   8.000  1.00  0.00           C\n"
+        "HETATM    2  O2  LIG B   1       9.200   8.000   8.000  1.00  0.00           O\n"
+    )
+
+    def _cofactor_run(self, tmp_path, protein_text):
+        protein = tmp_path / "protein_processed.pdb"
+        protein.write_text(protein_text)
+        (tmp_path / "LIG.pdb").write_text(self.LIG)
+        (tmp_path / "ALA1.pdb").write_text(self.LEU.replace("LEU", "ALA"))
+        run = QresFEP(
+            mutation="LEU1ALA",
+            chain="A",
+            system="protein",
+            force_field="OPLSAAM",
+            cluster="SNELLIUS",
+            workdir=tmp_path,
+            cofactors=["LIG"],
+        )
+        run.protein_pdb = protein
+        run.q_position = 1
+        run.read_pdb()
+        return [atom for residue in run.pdb.values() for atom in residue if atom[4] == "LIG"]
+
+    def test_cofactor_placed_by_qprep_prot_is_not_added_twice(self, tmp_path):
+        # qprep_prot -cof writes the cofactor into the prepared PDB, renumbered.
+        prepared_lig = self.LIG.replace("LIG B   1", "LIG B   2")
+        assert len(self._cofactor_run(tmp_path, self.LEU + prepared_lig)) == 2
+
+    def test_cofactor_missing_from_prepared_pdb_is_added(self, tmp_path):
+        assert len(self._cofactor_run(tmp_path, self.LEU)) == 2
+
 
 class TestForceFieldSupport:
     def test_non_oplsaam_force_fields_are_rejected(self, tmp_path):

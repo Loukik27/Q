@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from QligFEP.CLI.qprep_cli import Neutralizer, parse_arguments
+from QligFEP.CLI.qprep_cli import Neutralizer, parse_arguments, resolve_cofactor, write_merged_prm
 
 
 def _make_atom(record_type, serial, atom_name, residue_name, chain, resnum, x, y, z, element="C"):
@@ -933,3 +933,51 @@ class TestNeutralizerInsertionCode:
         assert sorted(nme_out["atom_name"]) == ["C", "H", "H1", "H2", "H3", "N"]
         glu_out = out[(out["insertion_code"] == "") & (out["residue_name"].isin(["GLU", "GLH"]))]
         assert (glu_out["residue_name"] == "GLH").all(), "GLU outside boundary should be neutralized to GLH"
+
+
+class TestCofactorFiles:
+    PRM = "[options]\n{option}\n[atom_types]\n{atype}\n[bonds]\n{bond}\n[angles]\n[torsions]\n[impropers]\n"
+
+    def _write_cofactor(self, directory, name, lib=True, prm=True):
+        (directory / f"{name}.pdb").write_text("")
+        if lib:
+            (directory / f"{name}.lib").write_text("")
+        if prm:
+            (directory / f"{name}.prm").write_text(
+                self.PRM.format(option="vdw_rule geometric", atype=f"{name.lower()}1 1.0", bond="lig1 lig2 1.0")
+            )
+
+    @pytest.mark.parametrize("entry", ["LIG", "LIG.pdb"])
+    def test_resolves_pdb_lib_and_prm_from_basename_or_pdb(self, tmp_path, entry):
+        self._write_cofactor(tmp_path, "LIG")
+        assert resolve_cofactor(entry, tmp_path) == (
+            tmp_path / "LIG.pdb",
+            tmp_path / "LIG.lib",
+            tmp_path / "LIG.prm",
+        )
+
+    def test_cofactor_without_lib_and_prm_relies_on_force_field(self, tmp_path):
+        self._write_cofactor(tmp_path, "ZN", lib=False, prm=False)
+        assert resolve_cofactor("ZN.pdb", tmp_path) == (tmp_path / "ZN.pdb", None, None)
+
+    @pytest.mark.parametrize("lib, prm", [(True, False), (False, True)])
+    def test_incomplete_lib_prm_pair_is_an_error(self, tmp_path, lib, prm):
+        self._write_cofactor(tmp_path, "LIG", lib=lib, prm=prm)
+        with pytest.raises(FileNotFoundError, match="both a .lib and a .prm"):
+            resolve_cofactor("LIG", tmp_path)
+
+    def test_missing_pdb_is_an_error(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="Cofactor PDB not found"):
+            resolve_cofactor("LIG", tmp_path)
+
+    def test_merged_prm_keeps_force_field_options_and_appends_cofactor_terms(self, tmp_path):
+        ff_prm = tmp_path / "FF.prm"
+        ff_prm.write_text(self.PRM.format(option="vdw_rule arithmetic", atype="CT 1.0", bond="CT CT 1.0"))
+        self._write_cofactor(tmp_path, "LIG")
+
+        merged = write_merged_prm(ff_prm, [tmp_path / "LIG.prm"], tmp_path / "FF_merged.prm").read_text()
+
+        assert "vdw_rule arithmetic" in merged
+        assert "vdw_rule geometric" not in merged
+        assert merged.index("CT 1.0") < merged.index("lig1 1.0") < merged.index("[bonds]")
+        assert merged.index("CT CT 1.0") < merged.index("lig1 lig2 1.0") < merged.index("[angles]")

@@ -414,7 +414,16 @@ class QresFEP:
                 "wild-type backbone."
             )
 
-        pdb_files = [self.protein_pdb] + [self.workdir / f"{c}.pdb" for c in self.cofactors]
+        pdb_files = [self.protein_pdb]
+        prepared_atoms = self._atom_signatures(self.protein_pdb)
+        for cofactor in self.cofactors:
+            cofactor_pdb = self.workdir / f"{cofactor}.pdb"
+            # `qprep_prot -cof` already places the cofactor in the prepared PDB;
+            # adding it again would stack two copies on the same coordinates.
+            if self._atom_signatures(cofactor_pdb) <= prepared_atoms:
+                logger.info(f"{cofactor} is already in {self.protein_pdb.name}; not adding it again")
+                continue
+            pdb_files.append(cofactor_pdb)
         serial = itertools.count(1)
         residue_counter = itertools.count(1)
         residue_numbers: dict[tuple, int] = {}
@@ -460,6 +469,19 @@ class QresFEP:
             raise MutationError(
                 f"Q residue {self.q_position} was not found in {self.protein_pdb.name}"
             )
+
+    @staticmethod
+    def _atom_signatures(pdb_path: Path) -> set[tuple[str, float, float, float]]:
+        """Return each solute atom as (residue, x, y, z), to spot repeated molecules."""
+        signatures = set()
+        for line in pdb_path.read_text().splitlines():
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            atom = pdb_parse_in(line)
+            if atom[4] in _SOLVENT_RESIDUES:
+                continue
+            signatures.add((atom[4], round(atom[8], 3), round(atom[9], 3), round(atom[10], 3)))
+        return signatures
 
     # ------------------------------------------------------------------
     # Hybrid residue parameters
@@ -571,11 +593,14 @@ class QresFEP:
                 out.write(f"{section}\n")
                 out.writelines(parameters[section])
 
+        # The probe topology holds the cofactors too, so their libraries are needed
+        # for qprep to get as far as reporting the missing hybrid terms.
         (self.inputfiles / "tmp.inp").write_text(
             "\n".join(
                 [
                     f"rl {self.hybrid_lib_name}",
                     f"rl {self.ff_lib_name}",
+                    *[f"rl {cofactor}.lib" for cofactor in self.cofactors],
                     "rprm tmp.prm",
                     "rp tmp.pdb",
                     f"boundary 1 {' '.join(str(c) for c in self.center)} {self.radius}",
