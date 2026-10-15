@@ -696,6 +696,14 @@ def filter_pdb_by_sphere(
         try:
             # Load Universe without guessing bonds initially
             u = mda.Universe(str(pdb_input))
+            # Atoms without an element column (a ligand PDB from GROMACS, say) get an
+            # empty type, for which no vdW radius exists; take it from the atom name.
+            untyped = u.atoms[u.atoms.types == ""]
+            if untyped.n_atoms:
+                from MDAnalysis.guesser.default_guesser import DefaultGuesser
+
+                guesser = DefaultGuesser(u)
+                untyped.types = [guesser.guess_atom_element(name) for name in untyped.names]
             # Then guess bonds with custom vdW radii (MDAnalysis 3.0 compatible)
             u.guess_TopologyAttrs(to_guess=["bonds"], vdwradii=custom_vdwradii)
         except Exception as e:

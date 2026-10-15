@@ -235,6 +235,25 @@ END
 class TestFilterOutOfSphereFragments:
     """Unit tests for the in-place filter_out_of_sphere_fragments wrapper."""
 
+    def test_atoms_without_element_column_do_not_disable_the_filter(self, tmp_path):
+        """A cofactor PDB with no element column must not make the filter keep everything."""
+        from QligFEP.pdb_utils import filter_out_of_sphere_fragments, read_pdb_to_dataframe
+
+        pdb_path = tmp_path / "system.pdb"
+        pdb_path.write_text(
+            "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+            "ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C\n"
+            "ATOM      3  N   ALA B   1      50.000  50.000  50.000  1.00  0.00           N\n"
+            "ATOM      4  CA  ALA B   1      51.458  50.000  50.000  1.00  0.00           C\n"
+            "ATOM      5  C1  LIG L   2       2.000   2.000   2.000  1.00  0.00              \n"
+            "ATOM      6  N2  LIG L   2       3.400   2.000   2.000  1.00  0.00              \n"
+        )
+
+        orig, filt = filter_out_of_sphere_fragments(pdb_path, [0.0, 0.0, 0.0], 10.0)
+
+        assert (orig, filt) == (6, 4)
+        assert "B" not in read_pdb_to_dataframe(pdb_path)["chain_id"].values
+
     def test_modifies_file_in_place(self, cdk2_protein_path, temp_pdb_dir):
         """Verify the function modifies the PDB file in place."""
         from QligFEP.pdb_utils import (
