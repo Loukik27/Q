@@ -465,3 +465,39 @@ END
 
         assert orig == 0, "Empty file should have 0 atoms"
         assert filt == 0, "Filtered should also be 0"
+
+
+class TestReindexPdbResidues:
+    """Residues are numbered by position, as Q reads them."""
+
+    def test_wrapped_residue_numbers_stay_separate_residues(self, tmp_path):
+        from QligFEP.pdb_utils import read_pdb_to_dataframe, reindex_pdb_residues
+
+        pdb_path = tmp_path / "box.pdb"
+        # Water 9999, then two waters whose numbers wrapped to 0 and 1, and one reusing 9999.
+        pdb_path.write_text(
+            "ATOM      1  O   HOH W9999       0.000   0.000   0.000  1.00  0.00           O\n"
+            "ATOM      2  O   HOH W   0       1.000   0.000   0.000  1.00  0.00           O\n"
+            "ATOM      3  O   HOH W   1       2.000   0.000   0.000  1.00  0.00           O\n"
+            "ATOM      4  O   HOH W9999       3.000   0.000   0.000  1.00  0.00           O\n"
+        )
+
+        mapping = reindex_pdb_residues(pdb_path, pdb_path)
+
+        assert list(read_pdb_to_dataframe(pdb_path)["residue_seq_number"]) == [1, 2, 3, 4]
+        assert mapping == {1: (9999, "W", ""), 2: (0, "W", ""), 3: (1, "W", ""), 4: (9999, "W", "")}
+
+    def test_large_numbers_wrap_instead_of_shifting_columns(self, tmp_path):
+        from QligFEP.pdb_utils import read_pdb_to_dataframe, write_dataframe_to_pdb
+
+        pdb_path = tmp_path / "big.pdb"
+        pdb_path.write_text("ATOM      1  O   HOH W   1       1.000   2.000   3.000  1.00  0.00           O\n")
+        frame = read_pdb_to_dataframe(pdb_path)
+        frame["atom_serial_number"] = 100001
+        frame["residue_seq_number"] = 10002
+
+        write_dataframe_to_pdb(frame, pdb_path)
+
+        row = read_pdb_to_dataframe(pdb_path).iloc[0]
+        assert (row["atom_serial_number"], row["residue_seq_number"]) == (1, 2)
+        assert (row["x"], row["y"], row["z"]) == (1.0, 2.0, 3.0)

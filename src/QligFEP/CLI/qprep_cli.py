@@ -931,6 +931,52 @@ class Neutralizer:
 
 _PARAMETER_SECTIONS = ("[options]", "[atom_types]", "[bonds]", "[angles]", "[torsions]", "[impropers]")
 
+# Water residue and atom names from other programs (GROMACS, CHARMM) mapped onto
+# the force fields' HOH entry.
+_WATER_RESIDUES = frozenset({"HOH", "SOL", "WAT", "TIP3", "T3P"})
+_WATER_ATOM_NAMES = {"OW": "O", "OH2": "O", "HW1": "H1", "HW2": "H2"}
+
+
+def split_crystal_waters(
+    pdb_df: pd.DataFrame, center: Sequence[float], radius: float
+) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+    """Separate the waters from the solute, as protprep.py did.
+
+    Waters are renamed to HOH (O, H1, H2), and only those whose oxygen lies
+    inside the sphere are kept. Molecules are told apart by position rather than
+    by residue number, which wraps after 9999 in a whole simulation box.
+
+    Returns:
+        The solute, the waters to append after it, and whether anything changed
+        (waters dropped, renamed or not already after the solute).
+    """
+    is_water = pdb_df["residue_name"].isin(_WATER_RESIDUES)
+    if not is_water.any():
+        return pdb_df, pdb_df.iloc[0:0], False
+
+    keys = pdb_df[["chain_id", "residue_seq_number", "insertion_code", "residue_name"]].astype(str)
+    molecule = keys.ne(keys.shift()).any(axis=1).cumsum()
+
+    waters = pdb_df[is_water].copy()
+    renamed = (waters["residue_name"] != "HOH").any() or waters["atom_name"].isin(_WATER_ATOM_NAMES).any()
+    waters["residue_name"] = "HOH"
+    waters["atom_name"] = waters["atom_name"].replace(_WATER_ATOM_NAMES)
+
+    oxygens = waters[waters["atom_name"] == "O"]
+    distances = np.sqrt(((oxygens[["x", "y", "z"]].astype(float) - list(center)) ** 2).sum(axis=1))
+    inside = molecule[oxygens.index[distances <= radius]]
+    kept = waters[molecule[waters.index].isin(inside)]
+    if len(kept) < len(waters):
+        logger.info(
+            f"Dropped {waters.index.size - kept.index.size} water atoms outside the sphere "
+            f"({(oxygens.index.size - inside.size)} molecules)"
+        )
+
+    solute = pdb_df[~is_water]
+    waters_were_last = solute.empty or solute.index.max() < waters.index.min()
+    changed = renamed or len(kept) < len(waters) or not waters_were_last
+    return solute.reset_index(drop=True), kept.reset_index(drop=True), changed
+
 
 def resolve_cofactor(entry: str, cwd: Path) -> tuple[Path, Path | None, Path | None]:
     """Return the ``.pdb``, ``.lib`` and ``.prm`` files of a cofactor.
@@ -1071,10 +1117,8 @@ def parse_arguments() -> argparse.Namespace:
         dest="cofactors",
         nargs="*",
         help=(
-            "List of cofactors (or ligands) to be added to the system, as basenames or .pdb files. "
-            "If NAME.lib and NAME.prm exist next to NAME.pdb, the library is read by qprep and "
-            "the parameters are merged with the force field's. Without them, the cofactor "
-            "residues must already be in the force field library."
+            "List of cofactors to be added to the system. Inputs should be one or more "
+            "pdb files containing the cofactors to be added."
         ),
     )
     parser.add_argument(
@@ -1168,15 +1212,19 @@ def main(
     ff_lib_path, ff_prm_path = get_force_field_paths(args.FF)
 
     # Keep crystallographic waters by default; qprep rejects added solvent that
-    # overlaps them.
+    # overlaps them. They are held apart from the solute and appended after it at
+    # the end, because Q needs all the solvent after the last solute residue.
     pdb_data = read_pdb_to_dataframe(pdb_file)
-    crystal_waters_df = pdb_data.query("residue_name == 'HOH'")
+    pdb_data, crystal_waters_df, waters_changed = split_crystal_waters(
+        pdb_data, [float(coord) for coord in args.cog], args.sphereradius
+    )
+    if waters_changed:
+        processing_steps.append("moved crystallographic waters after the solute")
     if not crystal_waters_df.empty:
-        water_keys = ["chain_id", "residue_seq_number", "insertion_code"]
-        crystal_water_count = len(crystal_waters_df[water_keys].drop_duplicates())
+        crystal_water_count = (crystal_waters_df["atom_name"] == "O").sum()
         if getattr(args, "strip_crystal_waters", False):
             logger.info(f"Removing {crystal_water_count} crystallographic water molecules")
-            pdb_data = pdb_data.query("residue_name != 'HOH'")
+            crystal_waters_df = crystal_waters_df.iloc[0:0]
             processing_steps.append("removed crystallographic waters")
         else:
             logger.info(
@@ -1191,7 +1239,7 @@ def main(
         logger.info(f"Adding {len(args.cofactors)} cofactor(s)")
         for cofactor in args.cofactors:
             cofactor_pdb, cofactor_lib, cofactor_prm = resolve_cofactor(cofactor, cwd)
-            pdb_data = append_pdb_to_another(pdb_data, cofactor_pdb, ignore_waters=True)
+            pdb_data = append_pdb_to_another(pdb_data, cofactor_pdb)
             if cofactor_lib is not None:
                 extra_libs.append(cofactor_lib)
                 extra_prms.append(cofactor_prm)
@@ -1241,6 +1289,10 @@ def main(
                     "POP atoms detected but naming convention is unclear — skipping conversion to be safe"
                 )
 
+    # Solvent goes after the whole solute, and atoms are numbered in file order.
+    pdb_data = pd.concat([pdb_data, crystal_waters_df], ignore_index=True)
+    pdb_data["atom_serial_number"] = [str(n) for n in range(1, len(pdb_data) + 1)]
+
     # Write the processed protein to a predictable filename
     if processing_steps:
         processed_pdb_path = pdb_path.with_name("protein_processed.pdb")
@@ -1257,12 +1309,9 @@ def main(
     pdb_path = processed_pdb_path
     logger.info(f"Final processed protein saved as: {processed_pdb_path}")
 
-    # Step 5: Reindex residues so that every residue has a unique number.
-    # Q/qprep ignores chain IDs, so multi-chain systems (e.g. protein + DNA)
-    # that reuse residue numbers across chains will collide without this step.
-    original_numbering = reindex_pdb_residues(processed_pdb_path, processed_pdb_path)
-
-    # Step 6: Filter out-of-sphere molecular fragments (chains, cofactors, lipids)
+    # Step 5: Filter out-of-sphere molecular fragments (chains, cofactors, lipids).
+    # Done before reindexing so a whole simulation box is cut down to the sphere
+    # before residues are renumbered, keeping the numbers within the PDB columns.
     if not args.skip_fragment_filter:
         center_coords = [float(coord) for coord in args.cog]
         orig_count, filt_count = filter_out_of_sphere_fragments(
@@ -1275,6 +1324,11 @@ def main(
             )
         else:
             logger.info("Fragment filtering: no fragments outside sphere to remove")
+
+    # Step 6: Reindex residues so that every residue has a unique number.
+    # Q/qprep ignores chain IDs, so multi-chain systems (e.g. protein + DNA)
+    # that reuse residue numbers across chains will collide without this step.
+    original_numbering = reindex_pdb_residues(processed_pdb_path, processed_pdb_path)
 
     qprep_inp_path = cwd / "qprep.inp"
     qprep_out_path = cwd / "qprep.out"

@@ -523,6 +523,10 @@ def write_dataframe_to_pdb(
             df["temp_factor"] = df["temp_factor"].apply(lambda x: f"{x:.2f}")
         if df["occupancy"].dtype == "float64":
             df["occupancy"] = df["occupancy"].apply(lambda x: f"{x:.2f}")
+        # Numbers too wide for their columns would shift every field after them, so
+        # they wrap around instead, as MD programs write large systems.
+        df["atom_serial_number"] = df["atom_serial_number"].map(lambda n: _wrap_pdb_number(n, 100000))
+        df["residue_seq_number"] = df["residue_seq_number"].map(lambda n: _wrap_pdb_number(n, 10000))
         for idx, row in df.iterrows():
             pdb_line = (
                 f"{row['record_type']:<6}{row['atom_serial_number']:>5} "
@@ -534,9 +538,17 @@ def write_dataframe_to_pdb(
             file.write(pdb_line)
             if idx in ter_positions:
                 file.write(
-                    f"TER   {int(row['atom_serial_number']) + 1:>5}      "
+                    f"TER   {_wrap_pdb_number(int(row['atom_serial_number']) + 1, 100000):>5}      "
                     f"{row['residue_name']:>3} {row['chain_id']:>1}{row['residue_seq_number']:>4}\n"
                 )
+
+
+def _wrap_pdb_number(value, limit: int):
+    """Wrap an integer PDB field at ``limit``; leave anything else untouched."""
+    try:
+        return int(value) % limit
+    except (TypeError, ValueError):
+        return value
 
 
 def detect_chain_breaks(df: pd.DataFrame) -> set[int]:
@@ -582,17 +594,19 @@ def reindex_pdb_residues(pdb_path: Path, out_pdb_path: Path) -> dict[int, tuple[
         file no longer carries.
     """
     pdb_df = read_pdb_to_dataframe(pdb_path)
-    uniq_indexes = pdb_df.set_index(
-        ["residue_seq_number", "residue_name", "chain_id", "insertion_code"]
-    ).index
-    resn_mapping = {resn: idx for idx, resn in enumerate(uniq_indexes.unique(), 1)}
-    pdb_df["residue_seq_number"] = uniq_indexes.map(resn_mapping)
+    keys = ["residue_seq_number", "residue_name", "chain_id", "insertion_code"]
+    # A new residue starts wherever the identifiers change, as Q reads them. Matching
+    # on the identifiers alone would merge residues whose numbers wrapped past 9999.
+    as_text = pdb_df[keys].astype(str)
+    new_numbers = as_text.ne(as_text.shift()).any(axis=1).cumsum()
+    first_atoms = pdb_df[keys].groupby(new_numbers.values).first()
+    pdb_df["residue_seq_number"] = new_numbers.values
     pdb_df["insertion_code"] = ""
     write_dataframe_to_pdb(pdb_df, str(out_pdb_path.resolve().absolute()))
 
     return {
-        new: (int(original), str(chain).strip(), str(icode).strip())
-        for (original, _name, chain, icode), new in resn_mapping.items()
+        int(new): (int(row.residue_seq_number), str(row.chain_id).strip(), str(row.insertion_code).strip())
+        for new, row in first_atoms.iterrows()
     }
 
 

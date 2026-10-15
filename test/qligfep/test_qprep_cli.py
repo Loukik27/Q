@@ -888,6 +888,63 @@ class TestFragmentFilteringInQprep:
         prepared = read_pdb_to_dataframe(tmp_path / "protein_processed.pdb")
         assert "HOH" not in prepared["residue_name"].values
 
+    def test_cofactors_are_placed_before_crystallographic_waters(self, tmp_path, monkeypatch):
+        """Q needs all solute ahead of the solvent, so the cofactor cannot follow the waters."""
+        from QligFEP.pdb_utils import read_pdb_to_dataframe
+
+        (tmp_path / "protein.pdb").write_text(self.PROTEIN_WITH_CRYSTAL_WATER)
+        (tmp_path / "LIG.pdb").write_text(
+            "HETATM    1  C1  LIG L   1       1.000   1.000   1.000  1.00  0.00           C\n"
+        )
+        args = self.create_mock_args(skip_fragment_filter=True)
+        args.cofactors = ["LIG.pdb"]
+
+        self._run_qprep_main(tmp_path, monkeypatch, args)
+
+        prepared = read_pdb_to_dataframe(tmp_path / "protein_processed.pdb")
+        assert list(prepared["residue_name"]) == ["ALA"] * 3 + ["LIG"] + ["HOH"] * 3
+        assert list(prepared["atom_serial_number"].astype(int)) == list(range(1, 8))
+        assert list(prepared["residue_seq_number"].astype(int)) == [1, 1, 1, 2, 3, 3, 3]
+
+    def test_waters_between_chains_are_moved_after_the_whole_solute(self, tmp_path, monkeypatch):
+        """Waters listed per chain must not split the solute, or Q reads them as solute."""
+        from QligFEP.pdb_utils import read_pdb_to_dataframe
+
+        (tmp_path / "protein.pdb").write_text(
+            "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+            "HETATM    2  O   HOH A 101       3.000   3.000   3.000  1.00 20.00           O\n"
+            "ATOM      3  N   GLY B   1       1.000   0.000   0.000  1.00  0.00           N\n"
+            "HETATM    4  O   HOH B 101       4.000   3.000   3.000  1.00 20.00           O\n"
+        )
+        args = self.create_mock_args(skip_fragment_filter=True)
+
+        self._run_qprep_main(tmp_path, monkeypatch, args)
+
+        prepared = read_pdb_to_dataframe(tmp_path / "protein_processed.pdb")
+        assert list(prepared["residue_name"]) == ["ALA", "GLY", "HOH", "HOH"]
+        assert list(prepared["residue_seq_number"].astype(int)) == [1, 2, 3, 4]
+
+    def test_gromacs_waters_are_renamed_and_cut_to_the_sphere(self, tmp_path, monkeypatch):
+        """A whole MD box: SOL/OW/HW1/HW2 become HOH/O/H1/H2, waters outside are dropped."""
+        from QligFEP.pdb_utils import read_pdb_to_dataframe
+
+        (tmp_path / "protein.pdb").write_text(
+            "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+            "ATOM      2  OW  SOL W   1       3.000   3.000   3.000  1.00  0.00           O\n"
+            "ATOM      3  HW1 SOL W   1       3.800   3.000   3.000  1.00  0.00           H\n"
+            "ATOM      4  HW2 SOL W   1       2.700   3.750   3.000  1.00  0.00           H\n"
+            "ATOM      5  OW  SOL W   2      30.000  30.000  30.000  1.00  0.00           O\n"
+            "ATOM      6  HW1 SOL W   2      30.800  30.000  30.000  1.00  0.00           H\n"
+            "ATOM      7  HW2 SOL W   2      29.700  30.750  30.000  1.00  0.00           H\n"
+        )
+        args = self.create_mock_args(skip_fragment_filter=True)
+
+        self._run_qprep_main(tmp_path, monkeypatch, args)
+
+        prepared = read_pdb_to_dataframe(tmp_path / "protein_processed.pdb")
+        assert list(prepared["residue_name"]) == ["ALA", "HOH", "HOH", "HOH"]
+        assert list(prepared["atom_name"]) == ["N", "O", "H1", "H2"]
+
 
 class TestNeutralizerForceFieldAtoms:
     """Neutral forms do not drop the same named proton in every force field."""
